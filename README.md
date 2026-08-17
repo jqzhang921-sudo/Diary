@@ -1,4 +1,4 @@
-# 信匣 · dairy-mcp
+# 信匣 · diary-mcp
 
 一个私人日记本，做成 MCP server。挂到网上之后，可以在 claude.ai 里加成「自定义连接器」，
 这样跟 Claude 聊天的时候它能真的读到你写的日记、也能往里留信——不再是网页里那个跟聊天窗口
@@ -47,12 +47,12 @@ node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"
 
 ### 第 1 步：把代码传到 GitHub
 
-你那个 `Dairy` 仓库还能用，只是里面的旧文件要换掉。
+你那个 `Diary` 仓库还能用，只是里面的旧文件要换掉。
 
 1. 打开仓库页面，把之前传的 `server.js`、`package.json`、`README.md` 三个文件删掉
    （每个文件点进去 → 右上角垃圾桶图标 → 页面底部 `Commit changes`）
 2. 回到仓库首页，点 `Add file` → `Upload files`
-3. 打开桌面上的 `dairy-mcp` 文件夹，**只选这 5 个东西**拖进去：
+3. 打开桌面上的 `diary-mcp` 文件夹，**只选这 5 个东西**拖进去：
    - `server.js`
    - `package.json`
    - `package-lock.json`
@@ -67,7 +67,7 @@ node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"
 
 1. 打开 <https://console.upstash.com/> ，用 GitHub 账号登录
 2. 点 `Create Database`
-   - Name：随便填，比如 `dairy`
+   - Name：随便填，比如 `diary`
    - Type/Primary Region：选离你近的，比如 `ap-northeast-1 (Tokyo)`
    - 其余保持默认，确认是免费档（Free）
 3. 建好后进入数据库详情页，往下找 **REST API** 那一块，会看到两个值：
@@ -80,9 +80,9 @@ node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"
 ### 第 3 步：在 Render 建服务
 
 1. <https://dashboard.render.com/> → `New` → `Web Service`
-2. 选 `Build and deploy from a Git repository`，连上你的 `Dairy` 仓库
+2. 选 `Build and deploy from a Git repository`，连上你的 `Diary` 仓库
 3. 各项填：
-   - **Name**：`dairy-mcp`（会变成域名的一部分）
+   - **Name**：`diary-mcp`（会变成域名的一部分）
    - **Language / Runtime**：`Node`
    - **Build Command**：`npm install`
    - **Start Command**：`npm start`
@@ -103,7 +103,7 @@ node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"
 部署成功的日志末尾应该长这样：
 
 ```
-dairy-mcp listening on :10000
+diary-mcp listening on :10000
   store    : upstash-redis
   timezone : Asia/Shanghai
   endpoint : POST /mcp/<MCP_SECRET>
@@ -118,7 +118,7 @@ dairy-mcp listening on :10000
 应该看到三行纯文本：
 
 ```
-dairy-mcp ok
+diary-mcp ok
 store: upstash-redis
 timezone: Asia/Shanghai
 ```
@@ -132,7 +132,7 @@ timezone: Asia/Shanghai
 3. 名字填 `信匣`，URL 填：
 
    ```
-   https://dairy-mcp-xxxx.onrender.com/mcp/你第0步生成的密钥
+   https://diary-mcp-xxxx.onrender.com/mcp/你第0步生成的密钥
    ```
 
    注意 `/mcp/` 后面直接跟密钥，中间没有别的东西。
@@ -161,7 +161,7 @@ Render 的 `Logs` 页面是主要的排查入口。把报错整段发我，我�
 ## 本地跑（想改代码的时候）
 
 ```bash
-cd Desktop/dairy-mcp
+cd Desktop/diary-mcp
 npm install
 node server.js
 ```
@@ -202,4 +202,4 @@ node server.js
 - 密钥用 `timingSafeEqual` 定长比较。
 - 请求体上限 1MB。
 - 存储层是可换的：配了 Upstash 走 Redis，没配走本地文件（原子重命名写入）。
-  两个 key 分开存（`dairy:entries` / `dairy:letters`），写日记不会重写信。
+  两个 key 分开存（`diary:entries` / `diary:letters`），写日记不会重写信。
