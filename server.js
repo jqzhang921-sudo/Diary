@@ -320,6 +320,26 @@ function readBody(req) {
   });
 }
 
+/** 日志里绝不能出现密钥：/mcp/<secret> 一律打成 /mcp/*** */
+function redactPath(pathname) {
+  return pathname.startsWith('/mcp/') ? '/mcp/***' : pathname;
+}
+
+/**
+ * 每个请求打一行。排查「客户端连不上」时这是唯一能直接看出真相的东西：
+ * 对方发的是什么 HTTP 方法、什么 JSON-RPC 方法、Accept 头要什么、最后拿到什么状态码。
+ */
+function logRequest(req, res, pathname, rpcMethod) {
+  const startedAt = Date.now();
+  res.on('finish', () => {
+    const ua = (req.headers['user-agent'] || '-').slice(0, 60);
+    console.log(
+      `[req] ${req.method} ${redactPath(pathname)} rpc=${rpcMethod || '-'} ` +
+        `-> ${res.statusCode} ${Date.now() - startedAt}ms accept="${req.headers.accept || '-'}" ua="${ua}"`
+    );
+  });
+}
+
 function sendJson(res, status, payload) {
   const body = JSON.stringify(payload);
   res.writeHead(status, {
@@ -344,32 +364,49 @@ const httpServer = createServer(async (req, res) => {
   }
 
   if (!isMcpPath(pathname)) {
+    logRequest(req, res, pathname);
     res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
     res.end('not found');
     return;
   }
 
-  // 无状态模式：GET（打开通知流）和 DELETE（关会话）都用不上。
-  if (req.method !== 'POST') {
-    rpcError(res, 405, -32000, 'Method not allowed. This server is stateless; use POST.');
+  // POST 承载 JSON-RPC；GET 是客户端来开通知流的（实测官方 SDK 一定会发一次）；
+  // DELETE 是关会话。三个都交给 transport 自己按协议处理 —— 之前这里对 GET 直接回
+  // 405，虽然协议允许，但客户端可能据此判定「服务器不可达」。别自己替 SDK 拒。
+  if (!['POST', 'GET', 'DELETE'].includes(req.method)) {
+    logRequest(req, res, pathname);
+    rpcError(res, 405, -32000, `Method ${req.method} not supported.`);
     return;
   }
 
   let parsedBody;
-  try {
-    const raw = await readBody(req);
-    parsedBody = raw ? JSON.parse(raw) : undefined;
-  } catch (err) {
-    rpcError(res, err.statusCode || 400, -32700, `Parse error: ${err.message}`);
-    return;
+  if (req.method === 'POST') {
+    try {
+      const raw = await readBody(req);
+      parsedBody = raw ? JSON.parse(raw) : undefined;
+    } catch (err) {
+      logRequest(req, res, pathname, 'parse-error');
+      rpcError(res, err.statusCode || 400, -32700, `Parse error: ${err.message}`);
+      return;
+    }
   }
+
+  logRequest(
+    req,
+    res,
+    pathname,
+    Array.isArray(parsedBody) ? '(batch)' : parsedBody?.method
+  );
 
   // 每个请求起一套新的 server+transport。无状态模式下这是官方推荐做法：
   // 并发的两个客户端不会撞到同一份请求 id 表。
   const mcp = buildMcpServer();
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
-    enableJsonResponse: true, // 直接回 JSON，不开 SSE 长连接，过代理更稳
+    // 用 MCP 默认的 SSE 响应模式。原先设了 enableJsonResponse: true（直接回 JSON，
+    // 想着过 Render 反代更稳），但 claude.ai 的连接器加不上，报 "Couldn't reach"，
+    // 而手工 curl 同一个端点 initialize 返回 200 —— 说明服务器本身没问题，
+    // 是响应形态客户端不认。回到默认最兼容的 SSE。
   });
 
   res.on('close', () => {
