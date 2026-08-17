@@ -123,8 +123,10 @@ function buildMcpServer() {
     {
       instructions:
         '这是主人的私人日记本。write_diary 记日记，read_diary 翻旧日记，' +
+        'delete_diary 删掉一篇（按 read_diary 给出的短 id），' +
         'leave_letter 给主人留一封信，read_letters 读之前留下的信。' +
-        '涉及日记内容时优先查一下这里，而不是凭记忆猜。',
+        '涉及日记内容时优先查一下这里，而不是凭记忆猜。' +
+        '删除没有回收站，删之前先确认主人指的是哪一篇。',
     }
   );
 
@@ -195,7 +197,8 @@ function buildMcpServer() {
       const body = hits
         .map((e) => {
           const head = e.mood ? `【${e.date}·${e.mood}】` : `【${e.date}】`;
-          return `${head}\n${e.content}`;
+          // 带上短 id，delete_diary 要靠它定位。不带的话「删掉那篇」就没法执行。
+          return `${head} [${e.id.slice(0, 8)}]\n${e.content}`;
         })
         .join('\n\n');
 
@@ -205,6 +208,45 @@ function buildMcpServer() {
           : `共 ${total} 篇：\n\n`;
 
       return text(header + body);
+    }
+  );
+
+  server.registerTool(
+    'delete_diary',
+    {
+      title: '删掉一篇日记',
+      description:
+        '按 id 删掉一篇日记。id 就是 read_diary 输出里方括号里那串，给前几位就够。' +
+        '被删的正文会一并返回 —— 万一删错了，照着原样再 write_diary 写回去即可。',
+      inputSchema: {
+        id: z
+          .string()
+          .min(4)
+          .describe('日记 id，read_diary 输出方括号里那串；至少给 4 位'),
+      },
+    },
+    async ({ id }) => {
+      const entries = await store.load(ENTRIES_KEY);
+      const matches = entries.filter((e) => e.id.startsWith(id));
+
+      if (matches.length === 0) {
+        return text(`没找到 id 以「${id}」开头的日记。先用 read_diary 看一下现有的 id。`);
+      }
+      // 宁可什么都不删，也不能猜。删错了没有回收站。
+      if (matches.length > 1) {
+        const list = matches
+          .map((e) => `  [${e.id.slice(0, 8)}] ${e.date} ${e.content.slice(0, 24)}…`)
+          .join('\n');
+        return text(`「${id}」匹配到 ${matches.length} 篇，无法确定删哪一篇。多给几位：\n${list}`);
+      }
+
+      const [victim] = matches;
+      const remaining = entries.filter((e) => e.id !== victim.id);
+      await store.save(ENTRIES_KEY, remaining);
+      return text(
+        `已删掉 ${victim.date} 那篇，还剩 ${remaining.length} 篇。\n` +
+          `删掉的正文附在下面，如果删错了可以原样写回去：\n\n${victim.content}`
+      );
     }
   );
 
@@ -320,8 +362,19 @@ function readBody(req) {
   });
 }
 
-/** 日志里绝不能出现密钥：/mcp/<secret> 一律打成 /mcp/*** */
+/**
+ * 日志里绝不能出现密钥。
+ *
+ * 只按 `/mcp/` 前缀脱敏是不够的 —— claude.ai 连接前会按 RFC 9728 探测 OAuth 发现端点，
+ * 而它会把**整段资源路径拼在后面**，于是密钥出现在
+ * `/.well-known/oauth-protected-resource/mcp/<secret>` 里，绕过了前缀判断。
+ * 实测踩过一次，密钥就这么进了 Render 的日志。所以这里改成：路径里凡是出现密钥就替换掉，
+ * 不管它在哪个位置。
+ */
 function redactPath(pathname) {
+  if (SECRET && pathname.includes(SECRET)) {
+    return pathname.split(SECRET).join('***');
+  }
   return pathname.startsWith('/mcp/') ? '/mcp/***' : pathname;
 }
 
