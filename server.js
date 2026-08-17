@@ -26,6 +26,12 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 
 const PORT = Number(process.env.PORT) || 3000;
 const SECRET = process.env.MCP_SECRET || '';
+/**
+ * 只读网页的密钥，跟 MCP 那个**故意分开**。
+ * 网页链接会进浏览器历史、书签、截图，比 API 调用更容易漏出去；分开之后即使它漏了，
+ * 拿到的人也只能看，不能写、不能删。没配这个变量时 /read 路由整个不存在（默认关闭）。
+ */
+const VIEW_SECRET = process.env.VIEW_SECRET || '';
 const TIMEZONE = process.env.TIMEZONE || 'Asia/Shanghai';
 const DATA_DIR = resolve(process.env.DATA_DIR || './data');
 const MAX_BODY_BYTES = 1_000_000;
@@ -328,10 +334,10 @@ function buildMcpServer() {
 
 // ---------------------------------------------------------------- HTTP
 
-/** 定长比较，避免用 === 比密钥时泄露前缀信息。 */
-function secretMatches(candidate) {
+/** 定长比较，避免用 === 比密钥时通过耗时泄露前缀信息。 */
+function timingSafeMatch(candidate, expected) {
   const a = Buffer.from(candidate, 'utf8');
-  const b = Buffer.from(SECRET, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
   if (a.length !== b.length) return false;
   return timingSafeEqual(a, b);
 }
@@ -341,7 +347,15 @@ function isMcpPath(pathname) {
   if (!SECRET) return pathname === '/mcp';
   const prefix = '/mcp/';
   if (!pathname.startsWith(prefix)) return false;
-  return secretMatches(pathname.slice(prefix.length));
+  return timingSafeMatch(pathname.slice(prefix.length), SECRET);
+}
+
+/** 只读网页：/read/<VIEW_SECRET>。没配 VIEW_SECRET 就当这个路由不存在。 */
+function isViewPath(pathname) {
+  if (!VIEW_SECRET) return false;
+  const prefix = '/read/';
+  if (!pathname.startsWith(prefix)) return false;
+  return timingSafeMatch(pathname.slice(prefix.length), VIEW_SECRET);
 }
 
 function readBody(req) {
@@ -372,10 +386,16 @@ function readBody(req) {
  * 不管它在哪个位置。
  */
 function redactPath(pathname) {
-  if (SECRET && pathname.includes(SECRET)) {
-    return pathname.split(SECRET).join('***');
+  let out = pathname;
+  // 两个密钥都要盖：MCP 的和只读网页的
+  for (const s of [SECRET, VIEW_SECRET]) {
+    if (s && out.includes(s)) out = out.split(s).join('***');
   }
-  return pathname.startsWith('/mcp/') ? '/mcp/***' : pathname;
+  if (out !== pathname) return out;
+  // 兜底：万一以后又冒出别的带密钥的路径形态，前缀这层至少能挡住最常见的两个
+  if (out.startsWith('/mcp/')) return '/mcp/***';
+  if (out.startsWith('/read/')) return '/read/***';
+  return out;
 }
 
 /**
@@ -391,6 +411,135 @@ function logRequest(req, res, pathname, rpcMethod) {
         `-> ${res.statusCode} ${Date.now() - startedAt}ms accept="${req.headers.accept || '-'}" ua="${ua}"`
     );
   });
+}
+
+// ---------------------------------------------------------------- 只读网页
+
+/** 日记正文是任意文本，直接拼进 HTML 会被当标签解析。所有插值都必须过这里。 */
+function esc(s) {
+  return String(s).replace(
+    /[&<>"']/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]
+  );
+}
+
+/** 正文里的换行要变成段落，否则 HTML 会把整篇压成一行。 */
+function paragraphs(textContent) {
+  return String(textContent)
+    .split(/\n\s*\n/)
+    .map((p) => `<p>${esc(p).replace(/\n/g, '<br>')}</p>`)
+    .join('');
+}
+
+function monthLabel(ym) {
+  const [y, m] = ym.split('-');
+  return `${y} 年 ${Number(m)} 月`;
+}
+
+/**
+ * 渲染整页。用 <details> 做按月折叠 —— 纯 HTML，不需要一行 JavaScript，
+ * 手机上也不会因为脚本没跑起来变成白屏。
+ */
+function renderPage(entries, letters) {
+  const byMonth = new Map();
+  for (const e of entries) {
+    const ym = e.date.slice(0, 7);
+    if (!byMonth.has(ym)) byMonth.set(ym, []);
+    byMonth.get(ym).push(e);
+  }
+  // 月份倒序（新的在上），每个月内部也倒序
+  const months = [...byMonth.keys()].sort().reverse();
+
+  const diaryHtml = months.length
+    ? months
+        .map((ym, i) => {
+          const items = byMonth
+            .get(ym)
+            .slice()
+            .reverse()
+            .map(
+              (e) =>
+                `<article><h3>${esc(e.date)}${
+                  e.mood ? ` <span class="mood">${esc(e.mood)}</span>` : ''
+                }</h3>${paragraphs(e.content)}</article>`
+            )
+            .join('');
+          // 最近一个月默认展开，更早的收起来只显示篇数
+          return `<details${i === 0 ? ' open' : ''}><summary>${monthLabel(ym)} <span class="count">${
+            byMonth.get(ym).length
+          } 篇</span></summary>${items}</details>`;
+        })
+        .join('')
+    : '<p class="empty">还没有日记。</p>';
+
+  const unread = letters.filter((l) => !l.openedAt).length;
+  const lettersHtml = letters.length
+    ? letters
+        .slice()
+        .reverse()
+        .map(
+          (l) =>
+            `<article><h3>${esc(l.writtenAtLocal || l.createdAt)}${
+              l.title ? ` · ${esc(l.title)}` : ''
+            }${l.openedAt ? '' : ' <span class="mood">未读</span>'}</h3>${paragraphs(l.content)}</article>`
+        )
+        .join('')
+    : '<p class="empty">匣子里还没有信。</p>';
+
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- 这个网址等于钥匙：禁止收录，也不要把它作为 referer 发给任何第三方 -->
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>信匣</title>
+<style>
+  :root { --bg:#faf9f7; --fg:#23201c; --dim:#8a8378; --line:#e6e1d9; --card:#fff; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#171614; --fg:#e8e4dd; --dim:#8c857a; --line:#2c2a26; --card:#1e1d1a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+    font:16px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    padding:24px 16px 64px; }
+  main { max-width:40rem; margin:0 auto; }
+  h1 { font-size:1.4rem; letter-spacing:.04em; margin:0 0 4px; font-weight:600; }
+  .sub { color:var(--dim); font-size:.85rem; margin:0 0 28px; }
+  h2 { font-size:.8rem; text-transform:uppercase; letter-spacing:.12em; color:var(--dim);
+    margin:40px 0 12px; font-weight:600; }
+  details { border-top:1px solid var(--line); }
+  summary { cursor:pointer; padding:12px 0; font-weight:600; list-style:none; }
+  summary::-webkit-details-marker { display:none; }
+  summary::before { content:"▸ "; color:var(--dim); }
+  details[open] > summary::before { content:"▾ "; }
+  .count { color:var(--dim); font-weight:400; font-size:.85rem; }
+  article { background:var(--card); border:1px solid var(--line); border-radius:10px;
+    padding:14px 18px; margin:0 0 12px; }
+  article h3 { font-size:.9rem; color:var(--dim); margin:0 0 8px; font-weight:600;
+    font-variant-numeric:tabular-nums; }
+  .mood { color:var(--fg); background:var(--bg); border:1px solid var(--line);
+    border-radius:99px; padding:1px 8px; font-size:.75rem; font-weight:400; }
+  article p { margin:0 0 .8em; white-space:pre-wrap; overflow-wrap:anywhere; }
+  article p:last-child { margin-bottom:0; }
+  .empty { color:var(--dim); }
+  footer { color:var(--dim); font-size:.75rem; margin-top:48px;
+    border-top:1px solid var(--line); padding-top:14px; }
+</style>
+</head>
+<body><main>
+  <h1>信匣</h1>
+  <p class="sub">共 ${entries.length} 篇日记${unread ? ` · ${unread} 封信还没读` : ''}</p>
+  ${diaryHtml}
+  <h2>信</h2>
+  ${lettersHtml}
+  <footer>
+    只读页面 —— 这里改不了任何东西，也不会把信标记成已读。<br>
+    这个网址等于钥匙，别分享、别截图带上地址栏。
+  </footer>
+</main></body>
+</html>`;
 }
 
 function sendJson(res, status, payload) {
@@ -413,6 +562,40 @@ const httpServer = createServer(async (req, res) => {
   if (pathname === '/' || pathname === '/healthz') {
     res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
     res.end(`dairy-mcp ok\nstore: ${store.kind}\ntimezone: ${TIMEZONE}\n`);
+    return;
+  }
+
+  // 只读网页
+  if (isViewPath(pathname)) {
+    logRequest(req, res, pathname, 'view');
+    if (req.method !== 'GET') {
+      res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('read-only');
+      return;
+    }
+    try {
+      const [entries, letters] = await Promise.all([
+        store.load(ENTRIES_KEY),
+        store.load(LETTERS_KEY),
+      ]);
+      const html = renderPage(entries, letters);
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        // 内容是私人日记：不让任何中间层或浏览器缓存留下副本
+        'cache-control': 'no-store, max-age=0',
+        // 万一网址被爬到，多一道保险（meta 标签之外的第二层）
+        'x-robots-tag': 'noindex, nofollow',
+        'referrer-policy': 'no-referrer',
+        'content-length': Buffer.byteLength(html),
+      });
+      res.end(html);
+    } catch (err) {
+      console.error('[view] render failed:', err);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('读取失败');
+      }
+    }
     return;
   }
 
@@ -482,6 +665,15 @@ httpServer.listen(PORT, () => {
   console.log(`dairy-mcp listening on :${PORT}`);
   console.log(`  store    : ${store.kind}${store.kind === 'local-file' ? ` (${DATA_DIR})` : ''}`);
   console.log(`  timezone : ${TIMEZONE}`);
+  console.log(
+    `  view page: ${VIEW_SECRET ? 'GET /read/<VIEW_SECRET>' : '未启用（没配 VIEW_SECRET）'}`
+  );
+  if (SECRET && VIEW_SECRET && SECRET === VIEW_SECRET) {
+    console.warn(
+      '  ⚠️  VIEW_SECRET 跟 MCP_SECRET 一样了，等于白分。' +
+        '网页链接一旦漏出去，别人就能读写和删除日记 —— 改成两个不同的值。'
+    );
+  }
   if (SECRET) {
     console.log(`  endpoint : POST /mcp/<MCP_SECRET>`);
   } else {

@@ -144,6 +144,27 @@ timezone: Asia/Shanghai
 
 ---
 
+## 只读网页（自己翻日记，不用问 Claude）
+
+配一个 `VIEW_SECRET` 环境变量，就多出一个页面：
+
+```
+https://你的域名/read/<VIEW_SECRET>
+```
+
+打开是排好版的日记，按月分组（最近一个月展开、更早的收起），底下带信。手机上可以存书签。
+纯服务端渲染，没有一行 JavaScript。
+
+**为什么用另一个密钥，不复用 `MCP_SECRET`：** 网页链接会进浏览器历史、书签、还有你可能顺手
+发出去的截图，比 API 调用更容易漏。分成两个之后，就算这个链接漏了，拿到的人**只能看，
+不能写、不能删**。两个值设成一样的话服务会在启动日志里警告你。
+
+不配 `VIEW_SECRET` 时，`/read/...` 整个路由不存在（返回 404）—— 默认关闭，不会因为忘了配就裸在外面。
+
+页面本身的几层保护：`no-store`（不留缓存副本）、`noindex`（真被爬到也不收录）、
+`no-referrer`（不把带密钥的网址作为 referer 发给第三方）、只接受 GET（POST 一律 405）。
+日记正文全部 HTML 转义，所以正文里写尖括号不会让页面错乱。
+
 ## 出问题的时候怎么查
 
 | 症状 | 大概是什么 |
@@ -186,6 +207,7 @@ node server.js
 | 变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
 | `MCP_SECRET` | 公网部署必填 | 空 | URL 路径里的密钥。空着的话端点是裸的 `/mcp` |
+| `VIEW_SECRET` | 否 | 空 | 只读网页的密钥，见下。**必须跟 `MCP_SECRET` 不同**。不配就没有这个网页 |
 | `UPSTASH_REDIS_REST_URL` | 公网部署必填 | 空 | Upstash REST 地址 |
 | `UPSTASH_REDIS_REST_TOKEN` | 公网部署必填 | 空 | Upstash REST token |
 | `TIMEZONE` | 否 | `Asia/Shanghai` | 「今天」按哪个时区算。Render 跑在 UTC 上，不设的话半夜写的日记会记成前一天 |
