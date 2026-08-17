@@ -1,145 +1,408 @@
-import express from "express";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { z } from "zod";
-import fs from "fs";
+/**
+ * 信匣 / dairy-mcp — 一个私人日记 MCP server。
+ *
+ * 四个工具：
+ *   write_diary   写一篇日记
+ *   read_diary    翻日记（按日期范围 / 关键词搜）
+ *   leave_letter  留一封信给主人
+ *   read_letters  读之前留下的信
+ *
+ * 传输方式是 Streamable HTTP（无状态模式），可以直接加成 claude.ai 的自定义连接器。
+ * 鉴权靠 URL 里的密钥路径：/mcp/<MCP_SECRET>
+ *
+ * 存储有两套后端，按环境变量自动选：
+ *   配了 UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN → 存 Upstash Redis
+ *   没配 → 存本地文件 DATA_DIR/diary.json（本地开发用；Render 免费版重启会丢）
+ */
 
-// ---- storage --------------------------------------------------------
-// File-based for simplicity. Works fine as long as your host gives you
-// a persistent disk (Render/Railway both do). If you move to a
-// serverless/ephemeral host later, swap this for a real database or a
-// hosted KV store (e.g. Upstash Redis) — the rest of the file doesn't
-// need to change, just loadEntries()/saveEntries().
+import { createServer } from 'node:http';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 
-const DATA_FILE = "./diary-data.json";
+import { z } from 'zod';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
-function loadEntries() {
-  try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
-  } catch {
-    return [];
-  }
-}
+const PORT = Number(process.env.PORT) || 3000;
+const SECRET = process.env.MCP_SECRET || '';
+const TIMEZONE = process.env.TIMEZONE || 'Asia/Shanghai';
+const DATA_DIR = resolve(process.env.DATA_DIR || './data');
+const MAX_BODY_BYTES = 1_000_000;
 
-function saveEntries(entries) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(entries, null, 2));
-}
+const ENTRIES_KEY = 'dairy:entries';
+const LETTERS_KEY = 'dairy:letters';
 
-// ---- MCP server + tools ----------------------------------------------
+// ---------------------------------------------------------------- 存储
 
-const server = new McpServer({
-  name: "xinxia-journal",
-  version: "1.0.0",
-});
+/**
+ * 两个后端都实现 load(key) / save(key, array)。
+ * Redis 那边 @upstash/redis 会自动 JSON 序列化/反序列化。
+ */
+function makeStore() {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
 
-server.registerTool(
-  "diary_write",
-  {
-    title: "写日记",
-    description: "在信匣日记里新增一条日记条目。写的人可以是用户，也可以是Claude自己想留一段话。",
-    inputSchema: {
-      text: z.string().describe("日记正文内容"),
-      author: z
-        .enum(["user", "claude"])
-        .optional()
-        .describe("这条是谁写的，默认user"),
-    },
-  },
-  async ({ text, author = "user" }) => {
-    const entries = loadEntries();
-    const entry = {
-      id: "e" + Date.now(),
-      ts: Date.now(),
-      text,
-      author,
-      reply: null,
-      replyAt: null,
-    };
-    entries.push(entry);
-    saveEntries(entries);
+  if (url && token) {
+    // 动态 import：没配 Upstash 时不去加载这个包
+    const clientPromise = import('@upstash/redis').then(
+      ({ Redis }) => new Redis({ url, token })
+    );
     return {
-      content: [{ type: "text", text: `已写入日记，id: ${entry.id}` }],
+      kind: 'upstash-redis',
+      async load(key) {
+        const redis = await clientPromise;
+        const value = await redis.get(key);
+        return Array.isArray(value) ? value : [];
+      },
+      async save(key, list) {
+        const redis = await clientPromise;
+        await redis.set(key, list);
+      },
     };
   }
-);
 
-server.registerTool(
-  "diary_list",
-  {
-    title: "翻日记",
-    description: "读取最近的日记条目，可选按关键词搜索。用来'翻旧日记'或者回顾最近写了什么。",
-    inputSchema: {
-      limit: z.number().optional().describe("返回条数，默认10"),
-      query: z.string().optional().describe("按关键词搜索日记正文或回信内容"),
+  return {
+    kind: 'local-file',
+    async load(key) {
+      try {
+        const raw = await readFile(join(DATA_DIR, `${key.replace(/:/g, '-')}.json`), 'utf8');
+        const value = JSON.parse(raw);
+        return Array.isArray(value) ? value : [];
+      } catch (err) {
+        if (err.code === 'ENOENT') return [];
+        throw err;
+      }
     },
-  },
-  async ({ limit = 10, query }) => {
-    let entries = loadEntries().sort((a, b) => b.ts - a.ts);
-    if (query) {
-      entries = entries.filter(
-        (e) =>
-          e.text.includes(query) || (e.reply && e.reply.includes(query))
-      );
+    async save(key, list) {
+      const target = join(DATA_DIR, `${key.replace(/:/g, '-')}.json`);
+      await mkdir(dirname(target), { recursive: true });
+      const tmp = `${target}.${process.pid}.tmp`;
+      await writeFile(tmp, JSON.stringify(list, null, 2), 'utf8');
+      await rename(tmp, target); // 原子替换，写一半断电不会留下坏文件
+    },
+  };
+}
+
+const store = makeStore();
+
+// ---------------------------------------------------------------- 日期
+
+/**
+ * 当天日期，按 TIMEZONE 算而不是按服务器时区。
+ * Render 跑在 UTC 上，北京时间凌晨一点写的日记否则会被记成前一天。
+ */
+function today() {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date()); // en-CA 输出就是 YYYY-MM-DD
+}
+
+function nowLocal() {
+  return new Intl.DateTimeFormat('sv-SE', {
+    timeZone: TIMEZONE,
+    dateStyle: 'short',
+    timeStyle: 'short',
+  }).format(new Date());
+}
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+// ---------------------------------------------------------------- 工具
+
+function text(s) {
+  return { content: [{ type: 'text', text: s }] };
+}
+
+function buildMcpServer() {
+  const server = new McpServer(
+    { name: 'dairy', version: '1.0.0' },
+    {
+      instructions:
+        '这是主人的私人日记本。write_diary 记日记，read_diary 翻旧日记，' +
+        'leave_letter 给主人留一封信，read_letters 读之前留下的信。' +
+        '涉及日记内容时优先查一下这里，而不是凭记忆猜。',
     }
-    entries = entries.slice(0, limit);
-    return { content: [{ type: "text", text: JSON.stringify(entries, null, 2) }] };
-  }
-);
+  );
 
-server.registerTool(
-  "diary_reply",
-  {
-    title: "回信",
-    description: "给某一条日记留一封回信，会以密封信封的样子存起来。",
-    inputSchema: {
-      entry_id: z.string().describe("要回信的日记条目id"),
-      reply_text: z.string().describe("回信正文"),
+  server.registerTool(
+    'write_diary',
+    {
+      title: '写日记',
+      description:
+        '往日记本里写一篇日记。date 不填就记成今天（按 ' +
+        TIMEZONE +
+        ' 的日期）。同一天可以写多篇。',
+      inputSchema: {
+        content: z.string().min(1).describe('日记正文'),
+        date: z.string().regex(DATE_RE).optional().describe('这篇日记对应的日子，YYYY-MM-DD'),
+        mood: z.string().optional().describe('心情，一两个词，可不填'),
+      },
     },
-  },
-  async ({ entry_id, reply_text }) => {
-    const entries = loadEntries();
-    const entry = entries.find((e) => e.id === entry_id);
-    if (!entry) {
-      return {
-        content: [{ type: "text", text: "没找到这条日记，id对不上。" }],
-        isError: true,
+    async ({ content, date, mood }) => {
+      const entries = await store.load(ENTRIES_KEY);
+      const entry = {
+        id: randomUUID(),
+        date: date || today(),
+        content,
+        mood: mood || null,
+        createdAt: new Date().toISOString(),
       };
+      entries.push(entry);
+      entries.sort((a, b) => a.date.localeCompare(b.date) || a.createdAt.localeCompare(b.createdAt));
+      await store.save(ENTRIES_KEY, entries);
+      return text(`已记下 ${entry.date} 的日记（第 ${entries.length} 篇）。`);
     }
-    entry.reply = reply_text;
-    entry.replyAt = Date.now();
-    saveEntries(entries);
-    return { content: [{ type: "text", text: "回信已经放进信封里了。" }] };
-  }
-);
+  );
 
-// ---- HTTP transport ----------------------------------------------------
-// Uses the streamable HTTP transport (the current recommended way to
-// expose a remote MCP server). One POST endpoint at /mcp.
+  server.registerTool(
+    'read_diary',
+    {
+      title: '翻日记',
+      description:
+        '翻日记本。可以按日期范围（from/to）筛，或者用 query 搜正文关键词。' +
+        '都不填就返回最近的几篇。',
+      inputSchema: {
+        query: z.string().optional().describe('在日记正文里搜这个词'),
+        from: z.string().regex(DATE_RE).optional().describe('起始日期 YYYY-MM-DD（含）'),
+        to: z.string().regex(DATE_RE).optional().describe('结束日期 YYYY-MM-DD（含）'),
+        limit: z.number().int().min(1).max(100).optional().describe('最多返回几篇，默认 10'),
+      },
+    },
+    async ({ query, from, to, limit }) => {
+      const entries = await store.load(ENTRIES_KEY);
+      const needle = query?.toLowerCase();
 
-const app = express();
-app.use(express.json());
+      let hits = entries.filter((e) => {
+        if (from && e.date < from) return false;
+        if (to && e.date > to) return false;
+        if (needle && !e.content.toLowerCase().includes(needle)) return false;
+        return true;
+      });
 
-app.post("/mcp", async (req, res) => {
-  try {
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
+      const total = hits.length;
+      hits = hits.slice(-(limit ?? 10)); // 取最近的 N 篇
+
+      if (total === 0) {
+        return text(
+          entries.length === 0 ? '日记本还是空的，一篇都没有。' : '这个条件下没找到日记。'
+        );
+      }
+
+      const body = hits
+        .map((e) => {
+          const head = e.mood ? `【${e.date}·${e.mood}】` : `【${e.date}】`;
+          return `${head}\n${e.content}`;
+        })
+        .join('\n\n');
+
+      const header =
+        total > hits.length
+          ? `共 ${total} 篇符合条件，下面是最近 ${hits.length} 篇：\n\n`
+          : `共 ${total} 篇：\n\n`;
+
+      return text(header + body);
+    }
+  );
+
+  server.registerTool(
+    'leave_letter',
+    {
+      title: '留一封信',
+      description:
+        '给主人留一封信，主人下次会看到。适合读完日记想说点什么、' +
+        '或者想留个只有下次才会被发现的小话的时候用。',
+      inputSchema: {
+        content: z.string().min(1).describe('信的内容'),
+        title: z.string().optional().describe('信的标题，可不填'),
+      },
+    },
+    async ({ content, title }) => {
+      const letters = await store.load(LETTERS_KEY);
+      letters.push({
+        id: randomUUID(),
+        title: title || null,
+        content,
+        createdAt: new Date().toISOString(),
+        writtenAtLocal: nowLocal(),
+        openedAt: null,
+      });
+      await store.save(LETTERS_KEY, letters);
+      const unread = letters.filter((l) => !l.openedAt).length;
+      return text(`信放进匣子里了。现在有 ${unread} 封还没被读过。`);
+    }
+  );
+
+  server.registerTool(
+    'read_letters',
+    {
+      title: '读信',
+      description:
+        '读匣子里的信。默认只返回还没读过的；读过之后会被标记，' +
+        'include_read 设为 true 可以把读过的也翻出来。',
+      inputSchema: {
+        include_read: z.boolean().optional().describe('是否也返回已经读过的信，默认 false'),
+        limit: z.number().int().min(1).max(100).optional().describe('最多返回几封，默认 10'),
+      },
+    },
+    async ({ include_read, limit }) => {
+      const letters = await store.load(LETTERS_KEY);
+      let hits = include_read ? letters : letters.filter((l) => !l.openedAt);
+      const total = hits.length;
+      hits = hits.slice(-(limit ?? 10));
+
+      if (total === 0) {
+        return text(include_read ? '匣子是空的，还没有信。' : '没有未读的信。');
+      }
+
+      const body = hits
+        .map((l) => {
+          const when = l.writtenAtLocal || l.createdAt;
+          const head = l.title ? `${when} · ${l.title}` : when;
+          return `—— ${head} ——\n${l.content}`;
+        })
+        .join('\n\n');
+
+      // 标记为已读。这里改的是 letters 里的同一批对象，直接整体存回去。
+      const stamp = new Date().toISOString();
+      let touched = false;
+      for (const l of hits) {
+        if (!l.openedAt) {
+          l.openedAt = stamp;
+          touched = true;
+        }
+      }
+      if (touched) await store.save(LETTERS_KEY, letters);
+
+      return text(`${total} 封：\n\n${body}`);
+    }
+  );
+
+  return server;
+}
+
+// ---------------------------------------------------------------- HTTP
+
+/** 定长比较，避免用 === 比密钥时泄露前缀信息。 */
+function secretMatches(candidate) {
+  const a = Buffer.from(candidate, 'utf8');
+  const b = Buffer.from(SECRET, 'utf8');
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+
+/** 请求路径对不对：配了密钥就是 /mcp/<secret>，没配就是 /mcp。 */
+function isMcpPath(pathname) {
+  if (!SECRET) return pathname === '/mcp';
+  const prefix = '/mcp/';
+  if (!pathname.startsWith(prefix)) return false;
+  return secretMatches(pathname.slice(prefix.length));
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(Object.assign(new Error('body too large'), { statusCode: 413 }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
     });
-    res.on("close", () => transport.close());
-    await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+function sendJson(res, status, payload) {
+  const body = JSON.stringify(payload);
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+function rpcError(res, status, code, message) {
+  sendJson(res, status, { jsonrpc: '2.0', id: null, error: { code, message } });
+}
+
+const httpServer = createServer(async (req, res) => {
+  const { pathname } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+
+  // 健康检查：Render 拿它判断服务活着，也可以用来把睡着的实例叫起来。
+  if (pathname === '/' || pathname === '/healthz') {
+    res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end(`dairy-mcp ok\nstore: ${store.kind}\ntimezone: ${TIMEZONE}\n`);
+    return;
+  }
+
+  if (!isMcpPath(pathname)) {
+    res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('not found');
+    return;
+  }
+
+  // 无状态模式：GET（打开通知流）和 DELETE（关会话）都用不上。
+  if (req.method !== 'POST') {
+    rpcError(res, 405, -32000, 'Method not allowed. This server is stateless; use POST.');
+    return;
+  }
+
+  let parsedBody;
+  try {
+    const raw = await readBody(req);
+    parsedBody = raw ? JSON.parse(raw) : undefined;
   } catch (err) {
-    console.error(err);
+    rpcError(res, err.statusCode || 400, -32700, `Parse error: ${err.message}`);
+    return;
+  }
+
+  // 每个请求起一套新的 server+transport。无状态模式下这是官方推荐做法：
+  // 并发的两个客户端不会撞到同一份请求 id 表。
+  const mcp = buildMcpServer();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    enableJsonResponse: true, // 直接回 JSON，不开 SSE 长连接，过代理更稳
+  });
+
+  res.on('close', () => {
+    transport.close().catch(() => {});
+    mcp.close().catch(() => {});
+  });
+
+  try {
+    await mcp.connect(transport);
+    await transport.handleRequest(req, res, parsedBody);
+  } catch (err) {
+    console.error('[mcp] request failed:', err);
     if (!res.headersSent) {
-      res.status(500).json({ error: "internal_error" });
+      rpcError(res, 500, -32603, 'Internal server error');
     }
   }
 });
 
-app.get("/", (_req, res) => {
-  res.send("信匣 journal MCP server is running.");
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`信匣 journal MCP server listening on port ${PORT}`);
+httpServer.listen(PORT, () => {
+  console.log(`dairy-mcp listening on :${PORT}`);
+  console.log(`  store    : ${store.kind}${store.kind === 'local-file' ? ` (${DATA_DIR})` : ''}`);
+  console.log(`  timezone : ${TIMEZONE}`);
+  if (SECRET) {
+    console.log(`  endpoint : POST /mcp/<MCP_SECRET>`);
+  } else {
+    console.log(`  endpoint : POST /mcp`);
+    console.warn(
+      '  ⚠️  MCP_SECRET 没设置，这个端点是裸的。部署到公网前一定要设上，' +
+        '否则谁拿到网址都能读写你的日记。'
+    );
+  }
+  if (store.kind === 'local-file') {
+    console.warn('  ⚠️  正在用本地文件存储。Render 免费版没有持久磁盘，重启会丢数据；' +
+      '线上请配 UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN。');
+  }
 });

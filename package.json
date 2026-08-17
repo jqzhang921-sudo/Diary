@@ -1,18 +1,19 @@
 {
-  "name": "xinxia-journal-mcp",
+  "name": "dairy-mcp",
   "version": "1.0.0",
-  "description": "信匣 - a diary MCP server Claude can read and write to",
+  "private": true,
+  "description": "A private diary MCP server — Claude can read your entries and leave you letters.",
   "type": "module",
   "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.0",
-    "express": "^4.19.2",
-    "zod": "^3.23.8"
-  },
-  "engines": {
-    "node": ">=18"
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@upstash/redis": "^1.34.0",
+    "zod": "^4.4.3"
   }
 }
